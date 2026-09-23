@@ -1,11 +1,12 @@
-# congruence_closure — 函数符号等式的同余闭包
+# congruence_closure — 函数符号等式的同余闭包 + 布尔组合求解
 
 离线、可复用、可产生证明的同余闭包（congruence closure）库，用于程序证明内核：
 对无解释函数符号的等式理论做判定，并为每个推出的等式/矛盾给出可独立验证的证明。
+本次迭代在其上新增布尔层：等式/不等式原子的与、或、非组合，枚举赋值判定可满足性。
 
 - Python 3.14.7，仅标准库，无任何第三方依赖，完全离线。
-- 核心模块：`congruence_closure.py`（单文件，可直接 `import`）。
-- 测试：`tests/test_congruence.py`；演示：`demo.py`。
+- 核心模块：`congruence_closure.py`（等式内核）、`boolean_solver.py`（布尔层）。
+- 测试：`tests/test_congruence.py`、`tests/test_boolean_solver.py`；演示：`demo.py`。
 
 ## 运行
 
@@ -14,7 +15,37 @@ python -m unittest discover -s tests -v
 python demo.py
 ```
 
-## 接口
+## 布尔层接口（boolean_solver，本次新增）
+
+```python
+from boolean_solver import BooleanSolver, And, Or, Not, SAT, UNSAT
+
+solver = BooleanSolver(max_atoms=8)        # max_atoms 可配，上限 8（MAX_ATOMS）
+a = solver.add_term("a")                   # 共享项仓库：hash-cons，子项跨原子/分支共享
+fa = solver.add_term("f", [a])
+e1 = solver.eq(a, b)                       # 等式原子；同字面量（参数序无关）共享同一 Atom
+f  = And(Or(e1, e2), solver.ne(a, c))      # ne(a,c) = Not(eq(a,c))，不等式入口，共享原子
+result = solver.solve(f)                   # 枚举赋值 + 逐分支重建等式环境
+result.status                              # SAT ("sat") 或 UNSAT ("unsat")
+result.assignment                          # SAT 时 {Atom: bool}；UNSAT 时为 None
+result.environments_tested                 # 实际重建并检查过的等式环境数
+solver.format_assignment(result)           # 打印友好形式，如 "a = b: True; ..."
+```
+
+- **判定方式**：对公式中的原子枚举全部真值赋值（≤ 2⁸ = 256 个）。布尔骨架满足的
+  候选，用共享项表**重建一个全新的 `CongruenceClosure` 环境**：`True` 原子断言
+  `assert_equal`，`False` 原子断言 `assert_distinct`；无矛盾即找到一个满足赋值。
+  分支之间、分支与求解器之间完全隔离，`solve` 不改变求解器任何状态，可重复调用。
+- **返回状态**：`SolveResult.status ∈ {"sat", "unsat"}`（常量为 `SAT`/`UNSAT`），
+  `result.satisfiable` 为布尔快捷方式。这是确定性的完备判定（在 ≤8 原子界内），
+  不存在"搜索预算耗尽"的第三种状态。
+- **空连接词**：`And()` 视为真（SAT，空赋值），`Or()` 视为假（UNSAT）。
+- **新错误类型**：`AtomLimitError`——不同原子数已达 `max_atoms`（≤ 8）上限；
+  抛出后不改变已跟踪的原子集。`ValidationError`/`UnknownNodeError`/`NodeLimitError`
+  复用等式内核的语义（非法节点 id、越界 id、共享 DAG 节点上限）。
+  公式树含其他求解器的原子、或非 Formula 对象，`solve` 抛 `ValidationError` 并定位参数。
+
+## 等式内核接口（congruence_closure，原有，未改动）
 
 ```python
 from congruence_closure import CongruenceClosure, verify_proof, verify_contradiction
@@ -77,21 +108,30 @@ verify_proof(proof, x, y, cc.input_equalities, cc.terms)   # 独立验证，返�
   换来实现的简单与回滚的绝对可靠；5000 节点上限下代价可忽略。
 - **递归深度**：`explain` / 验证器按项深度递归，必要时上调
   `sys.setrecursionlimit`（只升不降，界为 `4 * 节点数 + 100`）。
+- **布尔层**：项集中存放在一个只做 hash-consing 的共享仓库（不含任何断言），
+  所有原子和所有候选分支共享子项；每个通过布尔骨架的候选赋值重建一个全新的
+  等式环境来检查理论一致性，因此分支天然隔离、失败无需回滚求解器。
+  枚举顺序确定（按原子 id 的掩码递增），同一公式多次求解结果一致。
 
 ## 已知限制
 
 - 只实现本题契约内的同余闭包（等式 + 无解释函数符 + distinct 约束），
   不含算术、数组等其他理论，也不做函数符单射性等额外推理；不宣称兼容任何
   SMT-LIB 等行业标准格式。
+- 布尔层为预先全枚举（eager enumeration）：最多 8 个原子、256 个候选赋值，
+  每个候选重建一次等式环境。按题面范围未实现增量 SAT、学习子句、push/pop
+  或证明链输出；原子数超过 8 直接以 `AtomLimitError` 拒绝，不做部分求解。
 - 证明规模最坏情形随输入等式数与项深度增长（链式证明未做长度压缩）。
 - 快照式回滚在超大节点数下比增量 undo 日志更耗内存；在 5000 节点上限内无实际影响。
-- 测试中的参考实现（`tests/test_congruence.py` 内的全对暴力闭包）独立于被测核心，
+- 测试中的参考实现（两个测试文件内的全对暴力闭包与结构求值器）独立于被测核心，
   仅用于小实例交叉验证。
 
 ## 文件
 
 | 文件 | 说明 |
 | --- | --- |
-| `congruence_closure.py` | 核心库（数据结构、证明、验证器、错误类型） |
-| `tests/test_congruence.py` | 单元测试 + 独立参考闭包交叉验证 |
-| `demo.py` | 固定输入演示：正常证明、批次冲突回滚、非法输入拒绝 |
+| `congruence_closure.py` | 等式内核（数据结构、证明、验证器、错误类型） |
+| `boolean_solver.py` | 布尔层（与/或/非、不等式入口、枚举求解、SolveResult） |
+| `tests/test_congruence.py` | 内核单元测试 + 独立参考闭包交叉验证 |
+| `tests/test_boolean_solver.py` | 布尔层正常/边界/失败用例 + 独立预言机交叉验证 |
+| `demo.py` | 固定输入演示：证明、批次冲突回滚、非法输入、布尔层 SAT/UNSAT 与原子上限 |

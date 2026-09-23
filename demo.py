@@ -14,6 +14,13 @@ from congruence_closure import (
     verify_contradiction,
     verify_proof,
 )
+from boolean_solver import (
+    And,
+    AtomLimitError,
+    BooleanSolver,
+    Not,
+    Or,
+)
 
 
 def normal_scenario():
@@ -76,9 +83,58 @@ def rejection_scenario():
         print(f"invalid input rejected: {err}")
 
 
+def boolean_scenario():
+    print("\n=== 4. Boolean layer: and/or/not + disequality, SAT ===")
+    solver = BooleanSolver()
+    a = solver.add_term("a")
+    b = solver.add_term("b")
+    c = solver.add_term("c")
+    fa = solver.add_term("f", [a])
+    fb = solver.add_term("f", [b])
+    e_ab = solver.eq(a, b)
+    e_bc = solver.eq(b, c)
+    e_ac = solver.eq(a, c)  # ne(a, c) below shares this atom
+
+    formula = And(Or(e_ab, e_bc), solver.ne(a, c))
+    result = solver.solve(formula)
+    print("formula: (a=b OR b=c) AND a!=c")
+    print("status:", result.status)
+    print("satisfying assignment:", solver.format_assignment(result))
+    print("equality environments rebuilt and tested:",
+          result.environments_tested)
+
+    print("\n=== 5. Boolean layer: UNSAT via transitivity / congruence ===")
+    r1 = solver.solve(And(e_ab, e_bc, solver.ne(a, c)))
+    print("(a=b AND b=c AND a!=c):", r1.status,
+          "(transitivity forbids it)")
+    r2 = solver.solve(And(e_ab, solver.ne(fa, fb)))
+    print("(a=b AND f(a)!=f(b)):", r2.status,
+          "(congruence forces f(a)=f(b))")
+
+    # Branch isolation: solving never touches the shared term store.
+    print("shared term store nodes after all solves:", solver.node_count,
+          "(unchanged; branches rebuild fresh environments)")
+
+    print("\n=== 6. Rejection boundary: atom limit and invalid formula ===")
+    s2 = BooleanSolver()  # at most 8 distinct boolean atoms
+    ids = [s2.add_term(f"v{i}") for i in range(9)]
+    try:
+        for i in range(9):
+            s2.eq(ids[i], ids[(i + 1) % 9])  # the 9th pair is a 9th atom
+    except AtomLimitError as err:
+        print(f"atom limit rejected: {err}")
+    print("atoms tracked after rejection:", s2.atom_count,
+          "(no half-updated state)")
+    try:
+        solver.solve("a = b")  # not a Formula
+    except ValidationError as err:
+        print(f"invalid formula rejected: {err}")
+
+
 def main():
     normal_scenario()
     rejection_scenario()
+    boolean_scenario()
     print("\ndemo finished.")
 
 
