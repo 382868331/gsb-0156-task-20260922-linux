@@ -13,7 +13,13 @@ equality with uninterpreted function symbols:
   step), so ``explain`` returns an independently verifiable proof and a
   conflicting assertion returns a verifiable contradiction proof;
 * every mutating operation is atomic: on conflict the operation (or the whole
-  batch, for :meth:`CongruenceClosure.apply_batch`) is rolled back.
+  batch, for :meth:`CongruenceClosure.apply_batch`) is rolled back;
+* a boolean layer (:class:`BooleanSolver`) adds AND / OR / NOT formulas over
+  at most ``MAX_BOOLEAN_ATOMS`` (8) equality/inequality atoms.  Satisfiability
+  is decided by truth-table enumeration (at most 256 candidates); each
+  candidate is checked in a fresh congruence closure rebuilt from the shared
+  template DAG, true atoms asserted as equalities and false atoms ("opposite
+  equalities") as distinctness constraints, giving absolute branch isolation.
 
 Standard library only.  Python 3.14.7.
 """
@@ -24,12 +30,16 @@ import sys
 
 __all__ = [
     "DEFAULT_MAX_NODES",
+    "MAX_BOOLEAN_ATOMS",
     "CongruenceClosure",
+    "BooleanSolver",
+    "SatResult",
     "CongruenceError",
     "ValidationError",
     "ArityError",
     "UnknownNodeError",
     "NodeLimitError",
+    "AtomLimitError",
     "NotEqualError",
     "ContradictionError",
     "ProofError",
@@ -37,13 +47,21 @@ __all__ = [
     "verify_contradiction",
     "term_to_str",
     "proof_to_str",
+    "land",
+    "lor",
+    "lnot",
 ]
 
 DEFAULT_MAX_NODES = 5000
+MAX_BOOLEAN_ATOMS = 8
 
 _INPUT = "input"
 _CONG = "cong"
 _CONTRADICTION = "contradiction"
+
+_AND = "and"
+_OR = "or"
+_NOT = "not"
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +86,10 @@ class UnknownNodeError(ValidationError):
 
 class NodeLimitError(CongruenceError):
     """The shared DAG already holds ``max_nodes`` nodes."""
+
+
+class AtomLimitError(CongruenceError):
+    """A boolean problem uses more than ``MAX_BOOLEAN_ATOMS`` atoms."""
 
 
 class NotEqualError(CongruenceError):
@@ -539,6 +561,292 @@ class CongruenceClosure:
         subs = tuple(
             self._explain_chain(x, y, memo) for x, y in zip(args_p, args_q))
         return (_CONG, p, q, subs)
+
+
+# ---------------------------------------------------------------------------
+# Boolean layer: AND / OR / NOT over equality/inequality atoms
+# ---------------------------------------------------------------------------
+#
+# A formula is a plain nested tuple (cheap to build, easy to inspect):
+#
+#   atom                 -- non-negative int, an atom index (0-based);
+#   ("not", p)           -- negation;
+#   ("and", p1, p2, ...) -- conjunction (one or more children);
+#   ("or",  p1, p2, ...) -- disjunction (one or more children).
+#
+# Atom *i* stands for the equality ``a_i = b_i`` registered with
+# :meth:`BooleanSolver.add_atom`; its negation is the inequality
+# ``a_i != b_i``.  At most ``MAX_BOOLEAN_ATOMS`` (8) atoms are allowed.
+#
+# Satisfiability is decided by truth-table enumeration (at most 2**8 = 256
+# assignments).  Each candidate assignment is tested in a *fresh*
+# CongruenceClosure whose term DAG is rebuilt from the shared template DAG
+# (shared subterms hash-cons again inside the candidate): true atoms are
+# asserted as equalities, false atoms as distinctness constraints.  Branch
+# isolation is therefore absolute -- a contradictory candidate never leaks
+# state into the others or into the solver.
+
+
+def land(*children):
+    """Construct an ``("and", ...)`` formula node."""
+    return (_AND,) + tuple(children)
+
+
+def lor(*children):
+    """Construct an ``("or", ...)`` formula node."""
+    return (_OR,) + tuple(children)
+
+
+def lnot(child):
+    """Construct a ``("not", child)`` formula node."""
+    return (_NOT, child)
+
+
+class SatResult:
+    """Outcome of :meth:`BooleanSolver.solve`.
+
+    * ``satisfiable`` -- bool;
+    * ``assignment``  -- tuple of bools aligned with the solver's atoms when
+      satisfiable (``assignment[i]`` is the truth value of atom *i*), else
+      ``None``;
+    * ``assignments`` -- tuple of every satisfying assignment when
+      ``solve(..., find_all=True)``, else a one-element tuple (or empty).
+    """
+
+    __slots__ = ("satisfiable", "assignment", "assignments")
+
+    def __init__(self, assignments):
+        self.assignments = tuple(assignments)
+        self.satisfiable = bool(self.assignments)
+        self.assignment = self.assignments[0] if self.assignments else None
+
+    def __bool__(self):
+        return self.satisfiable
+
+    def __repr__(self):
+        if self.satisfiable:
+            return f"SatResult(sat, assignment={self.assignment!r})"
+        return "SatResult(unsat)"
+
+
+class BooleanSolver:
+    """Enumerative SAT over equality/inequality atoms on top of the kernel.
+
+    The solver owns a *template* :class:`CongruenceClosure` in which terms
+    are registered with :meth:`add_term` and atoms with :meth:`add_atom`.
+    The template is never asserted into: :meth:`solve` rebuilds a fresh
+    closure for every candidate assignment, so the solver stays reusable
+    across calls and a contradictory candidate cannot leave partial state.
+    """
+
+    def __init__(self, max_nodes=DEFAULT_MAX_NODES):
+        # Delegate validation of max_nodes to the kernel constructor.
+        self._template = CongruenceClosure(max_nodes=max_nodes)
+        self._atoms = []            # [(a, b)] in registration order
+        self._atom_index = {}       # normalized pair -> atom index
+
+    # -- read-only views ----------------------------------------------------
+
+    @property
+    def max_nodes(self):
+        return self._template.max_nodes
+
+    @property
+    def atom_count(self):
+        return len(self._atoms)
+
+    @property
+    def atom_pairs(self):
+        """Tuple of registered atom pairs ``(a, b)``, registration order."""
+        return tuple(self._atoms)
+
+    @property
+    def terms(self):
+        """Tuple ``(func, arg_ids)`` of the template DAG, indexed by id."""
+        return self._template.terms
+
+    # -- term / atom registration -------------------------------------------
+
+    def add_term(self, func, args=()):
+        """Add a term to the template DAG (delegates to the kernel)."""
+        return self._template.add_term(func, args)
+
+    def add_atom(self, a, b):
+        """Register the equality atom ``a = b`` and return its index.
+
+        The symmetric pair is deduplicated (``(a, b)`` and ``(b, a)`` are
+        the same atom).  At most :data:`MAX_BOOLEAN_ATOMS` atoms may be
+        registered; exceeding the bound raises :class:`AtomLimitError`.
+        """
+        self._template._check_node(a, "add_atom: a")
+        self._template._check_node(b, "add_atom: b")
+        key = _norm_pair(a, b)
+        existing = self._atom_index.get(key)
+        if existing is not None:
+            return existing
+        if len(self._atoms) >= MAX_BOOLEAN_ATOMS:
+            raise AtomLimitError(
+                f"add_atom: at most {MAX_BOOLEAN_ATOMS} boolean atoms are "
+                f"allowed, already have {len(self._atoms)}")
+        idx = len(self._atoms)
+        self._atoms.append(key)
+        self._atom_index[key] = idx
+        return idx
+
+    # -- formula validation --------------------------------------------------
+
+    def _validate_formula(self, root, where):
+        # Iterative over an explicit stack so arbitrarily deep nesting is
+        # reported as a located ValidationError, never a RecursionError.
+        stack = [(root, where)]
+        while stack:
+            node, pos = stack.pop()
+            if isinstance(node, bool) or not isinstance(node, int):
+                if not isinstance(node, (tuple, list)):
+                    raise ValidationError(
+                        f"{pos}: formula node must be an atom index (int) or "
+                        f"a tagged tuple, got {node!r}")
+                if not node:
+                    raise ValidationError(
+                        f"{pos}: formula tuple must have a tag as first "
+                        f"element")
+                tag = node[0]
+                if not isinstance(tag, str) or tag not in (_AND, _OR, _NOT):
+                    raise ValidationError(
+                        f"{pos}: unknown connective {tag!r}; expected 'and', "
+                        f"'or' or 'not'")
+                children = node[1:]
+                if tag == _NOT:
+                    if len(children) != 1:
+                        raise ValidationError(
+                            f"{pos}: 'not' takes exactly 1 child, got "
+                            f"{len(children)}")
+                elif not children:
+                    raise ValidationError(
+                        f"{pos}: {tag!r} takes at least 1 child")
+                for i, child in reversed(list(enumerate(children))):
+                    stack.append((child, f"{pos}.{tag}[{i}]"))
+            elif node < 0 or node >= len(self._atoms):
+                raise ValidationError(
+                    f"{pos}: atom index {node} out of range; solver has "
+                    f"{len(self._atoms)} atom(s)")
+
+    # -- evaluation and candidate construction -------------------------------
+
+    @staticmethod
+    def _eval(root, bits):
+        # Iterative post-order evaluation (formula depth is not bounded by
+        # the 8-atom limit).
+        stack = [(root, False)]
+        values = []
+        while stack:
+            node, processed = stack.pop()
+            if isinstance(node, int) and not isinstance(node, bool):
+                values.append(bits[node])
+                continue
+            tag = node[0]
+            if not processed:
+                stack.append((node, True))
+                if tag == _NOT:
+                    stack.append((node[1], False))
+                else:
+                    for child in reversed(node[1:]):
+                        stack.append((child, False))
+            elif tag == _NOT:
+                values.append(not values.pop())
+            elif tag == _AND:
+                result = True
+                for _ in node[1:]:
+                    result = values.pop() and result
+                values.append(result)
+            else:
+                result = False
+                for _ in node[1:]:
+                    result = values.pop() or result
+                values.append(result)
+        return values[0]
+
+    def _rebuild(self, bits):
+        """Rebuild a fresh kernel closure with the signed literals of bits.
+
+        Returns the closure on success, or ``None`` when the assignment is
+        inconsistent (a :class:`ContradictionError` from the kernel).
+        """
+        cc = CongruenceClosure(max_nodes=self._template.max_nodes)
+        mapping = {}
+        for old, (func, old_args) in enumerate(self._template.terms):
+            args = tuple(mapping[x] for x in old_args)
+            mapping[old] = cc.add_term(func, args)
+        try:
+            for i, (a, b) in enumerate(self._atoms):
+                x, y = mapping[a], mapping[b]
+                if bits[i]:
+                    cc.assert_equal(x, y)
+                else:
+                    cc.assert_distinct(x, y)
+        except ContradictionError:
+            return None
+        return cc
+
+    # -- solving --------------------------------------------------------------
+
+    def solve(self, formula, *, find_all=False):
+        """Enumerate assignments satisfying ``formula``.
+
+        Returns a :class:`SatResult`.  Enumeration order is deterministic:
+        atom 0 is the least-significant bit of the candidate mask, so the
+        all-false assignment is tried first.  Each candidate is tested in a
+        rebuilt, fully isolated equality environment.
+        """
+        self._validate_formula(formula, "solve: formula")
+        n = len(self._atoms)
+        found = []
+        for mask in range(1 << n):
+            bits = tuple(bool((mask >> i) & 1) for i in range(n))
+            if not self._eval(formula, bits):
+                continue
+            if self._rebuild(bits) is None:
+                continue
+            found.append(bits)
+            if not find_all:
+                break
+        return SatResult(found)
+
+    def all_models(self, formula):
+        """Return the tuple of every satisfying assignment of ``formula``."""
+        return self.solve(formula, find_all=True).assignments
+
+    def build_environment(self, assignment):
+        """Rebuild the kernel closure for one (satisfying) assignment.
+
+        Useful after :meth:`solve` for further equality queries against the
+        model (``are_equal``, ``explain``, ...).  Raises
+        :class:`ContradictionError` if the assignment is itself
+        inconsistent with congruence.
+        """
+        if not isinstance(assignment, (tuple, list)):
+            raise ValidationError(
+                f"build_environment: assignment must be a tuple/list of bool, "
+                f"got {type(assignment).__name__}")
+        if len(assignment) != len(self._atoms):
+            raise ValidationError(
+                f"build_environment: assignment length {len(assignment)} "
+                f"does not match atom count {len(self._atoms)}")
+        bits = []
+        for i, v in enumerate(assignment):
+            if not isinstance(v, bool):
+                raise ValidationError(
+                    f"build_environment: assignment[{i}] must be bool, got "
+                    f"{type(v).__name__} ({v!r})")
+            bits.append(v)
+        cc = self._rebuild(tuple(bits))
+        if cc is None:
+            raise ContradictionError(
+                "assignment is inconsistent with the equality theory "
+                "(a false atom is forced equal or a true atom is distinct)",
+                proof=None, inputs=frozenset(), distincts=frozenset(),
+                terms=self._template.terms)
+        return cc
 
 
 # ---------------------------------------------------------------------------
