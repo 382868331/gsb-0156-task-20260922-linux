@@ -13,13 +13,20 @@ equality with uninterpreted function symbols:
   step), so ``explain`` returns an independently verifiable proof and a
   conflicting assertion returns a verifiable contradiction proof;
 * every mutating operation is atomic: on conflict the operation (or the whole
-  batch, for :meth:`CongruenceClosure.apply_batch`) is rolled back.
+  batch, for :meth:`CongruenceClosure.apply_batch`) is rolled back;
+* scoped assumptions: :meth:`CongruenceClosure.push` /
+  :meth:`CongruenceClosure.pop` bracket a layer of equalities, distinct
+  assertions and new terms; popping undoes the whole layer (equivalence
+  classes, parent signatures, proof forest and conflict state return to
+  exactly what they were at ``push``) via a per-scope change journal --
+  ``push`` itself never copies the term graph.
 
 Standard library only.  Python 3.14.7.
 """
 
 from __future__ import annotations
 
+import contextlib
 import sys
 
 __all__ = [
@@ -29,9 +36,11 @@ __all__ = [
     "ValidationError",
     "ArityError",
     "UnknownNodeError",
+    "StaleNodeError",
     "NodeLimitError",
     "NotEqualError",
     "ContradictionError",
+    "ScopeError",
     "ProofError",
     "verify_proof",
     "verify_contradiction",
@@ -44,6 +53,8 @@ DEFAULT_MAX_NODES = 5000
 _INPUT = "input"
 _CONG = "cong"
 _CONTRADICTION = "contradiction"
+
+_ABSENT = object()  # journal sentinel: key did not exist at scope entry
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +77,14 @@ class UnknownNodeError(ValidationError):
     """A node id is outside the range of existing nodes."""
 
 
+class StaleNodeError(UnknownNodeError):
+    """A node id created inside a scope that has since been popped.
+
+    Node ids are never reused: a structurally identical term built after
+    the pop gets a fresh id, so an old handle can never silently alias it.
+    """
+
+
 class NodeLimitError(CongruenceError):
     """The shared DAG already holds ``max_nodes`` nodes."""
 
@@ -81,6 +100,10 @@ class NotEqualError(CongruenceError):
 
 class ProofError(CongruenceError):
     """A proof failed independent verification; the message locates the step."""
+
+
+class ScopeError(CongruenceError):
+    """``pop`` was called at the base level: there is no scope to leave."""
 
 
 class ContradictionError(CongruenceError):
@@ -130,6 +153,24 @@ def _ensure_recursion_limit(needed):
 # Core data structure
 # ---------------------------------------------------------------------------
 
+class _Scope:
+    """One push/pop layer: an undo journal plus length markers.
+
+    ``journal`` maps ``(kind, key)`` to the value the location held when it
+    was first written inside this scope (``_ABSENT`` if it did not exist).
+    Only the top scope journals, so ``push`` itself is O(1) and never
+    copies the term graph.
+    """
+
+    __slots__ = ("journal", "n_terms", "n_inputs", "n_distincts")
+
+    def __init__(self, n_terms, n_inputs, n_distincts):
+        self.journal = {}
+        self.n_terms = n_terms
+        self.n_inputs = n_inputs
+        self.n_distincts = n_distincts
+
+
 class CongruenceClosure:
     """Proof-producing congruence closure over a shared term DAG."""
 
@@ -141,6 +182,8 @@ class CongruenceClosure:
             raise ValidationError(f"max_nodes must be >= 0, got {max_nodes}")
         self._max_nodes = max_nodes
         self._terms = []            # node id -> (func, tuple of arg ids)
+        self._alive = []            # node id -> False once its scope popped
+        self._live_count = 0        # number of currently valid nodes
         self._hashcons = {}         # (func, args) -> node id
         self._arity = {}            # func -> arity fixed at first use
         self._uf = []               # union-find parent links
@@ -151,6 +194,7 @@ class CongruenceClosure:
         self._forbidden = {}        # uf root -> {other root: original pair}
         self._inputs = []           # asserted equalities, in order
         self._distincts = []        # asserted distinct pairs, in order
+        self._scopes = []           # stack of _Scope frames
 
     # -- read-only views ----------------------------------------------------
 
@@ -160,11 +204,22 @@ class CongruenceClosure:
 
     @property
     def node_count(self):
-        return len(self._terms)
+        """Number of currently valid (live) nodes in the shared DAG."""
+        return self._live_count
+
+    @property
+    def scope_depth(self):
+        """Number of currently open assumption scopes (0 = base level)."""
+        return len(self._scopes)
 
     @property
     def terms(self):
-        """Tuple of ``(func, arg_ids)`` indexed by node id (a copy)."""
+        """Tuple of ``(func, arg_ids)`` indexed by node id (a copy).
+
+        Node ids are stable, so entries created inside a scope that was
+        later popped remain as tombstones; they are rejected by every
+        operation taking a node id (:class:`StaleNodeError`).
+        """
         return tuple(self._terms)
 
     @property
@@ -202,6 +257,39 @@ class CongruenceClosure:
             raise UnknownNodeError(
                 f"{where}: unknown node id {nid}; valid range is "
                 f"0..{len(self._terms) - 1}")
+        if not self._alive[nid]:
+            raise StaleNodeError(
+                f"{where}: node id {nid} was created in a scope that has "
+                f"been popped; the handle is no longer valid")
+
+    # -- scope journal ---------------------------------------------------------
+
+    def _journal(self, kind, key, old_value):
+        """Record ``old_value`` for ``(kind, key)`` in the top scope.
+
+        Only the first write of a location within a scope is recorded, so
+        replaying the journal restores exactly the state at ``push``.
+        """
+        if self._scopes:
+            self._scopes[-1].journal.setdefault((kind, key), old_value)
+
+    def _journal_idx(self, kind, arr, i):
+        if self._scopes:
+            self._scopes[-1].journal.setdefault((kind, i), arr[i])
+
+    def _journal_sig(self, sig):
+        if self._scopes:
+            self._journal("sig", sig, self._sig.get(sig, _ABSENT))
+
+    def _journal_parents(self, root):
+        if self._scopes:
+            lst = self._class_parents.get(root)
+            self._journal("cp", root, _ABSENT if lst is None else lst[:])
+
+    def _journal_forbidden(self, root):
+        if self._scopes:
+            d = self._forbidden.get(root)
+            self._journal("frb", root, _ABSENT if d is None else dict(d))
 
     # -- union-find ----------------------------------------------------------
 
@@ -211,7 +299,10 @@ class CongruenceClosure:
         while uf[root] != root:
             root = uf[root]
         while uf[x] != root:
-            uf[x], x = root, uf[x]
+            nxt = uf[x]
+            self._journal_idx("uf", uf, x)
+            uf[x] = root
+            x = nxt
         return root
 
     # -- proof forest ---------------------------------------------------------
@@ -225,7 +316,9 @@ class CongruenceClosure:
             chain.append((cur, parent, reason))
             cur = parent
         for node, parent, reason in reversed(chain):
+            self._journal_idx("pf", self._pf, parent)
             self._pf[parent] = (node, reason)
+        self._journal_idx("pf", self._pf, x)
         self._pf[x] = None
 
     # -- snapshots (atomic operations / batch rollback) ----------------------
@@ -243,13 +336,15 @@ class CongruenceClosure:
             len(self._terms),
             dict(self._hashcons),
             dict(self._arity),
+            self._live_count,
         )
 
     def _restore(self, snap):
         (self._uf, self._size, self._pf, self._sig, self._class_parents,
          self._forbidden, self._inputs, self._distincts, nterms,
-         self._hashcons, self._arity) = snap
+         self._hashcons, self._arity, self._live_count) = snap
         del self._terms[nterms:]
+        del self._alive[nterms:]
 
     # -- term construction ----------------------------------------------------
 
@@ -280,7 +375,7 @@ class CongruenceClosure:
         existing = self._hashcons.get(key)
         if existing is not None:
             return existing
-        if len(self._terms) >= self._max_nodes:
+        if self._live_count >= self._max_nodes:
             raise NodeLimitError(
                 f"add_term: node limit {self._max_nodes} reached; "
                 f"cannot add {func!r}")
@@ -288,17 +383,26 @@ class CongruenceClosure:
         try:
             nid = len(self._terms)
             self._terms.append(key)
+            self._alive.append(True)
+            self._live_count += 1
+            self._journal("hc", key, _ABSENT)
             self._hashcons[key] = nid
-            self._arity.setdefault(func, len(arg_tuple))
+            if func not in self._arity:
+                self._journal("ar", func, _ABSENT)
+                self._arity[func] = len(arg_tuple)
             self._uf.append(nid)
             self._size.append(1)
             self._pf.append(None)
+            self._journal("cp", nid, _ABSENT)
             self._class_parents[nid] = []
             for a in dict.fromkeys(arg_tuple):
-                self._class_parents[self._find(a)].append(nid)
+                root = self._find(a)
+                self._journal_parents(root)
+                self._class_parents[root].append(nid)
             sig = (func, tuple(self._find(a) for a in arg_tuple))
             other = self._sig.get(sig)
             if other is None:
+                self._journal_sig(sig)
                 self._sig[sig] = nid
             else:
                 self._merge(nid, other, (_CONG, nid, other))
@@ -329,11 +433,15 @@ class CongruenceClosure:
                 ra, rb = rb, ra
             # Proof forest: link the two trees with the reason edge a -- b.
             self._flip_to_root(a)
+            self._journal_idx("pf", self._pf, a)
             self._pf[a] = (b, reason)
+            self._journal_idx("uf", self._uf, ra)
             self._uf[ra] = rb
+            self._journal_idx("size", self._size, rb)
             self._size[rb] += self._size[ra]
             self._merge_forbidden(ra, rb)
             # Recompute signatures of parents of the merged-away class.
+            self._journal_parents(ra)
             for p in self._class_parents.pop(ra, ()):
                 fp, argsp = self._terms[p]
                 sigp = (fp, tuple(self._find(x) for x in argsp))
@@ -341,11 +449,15 @@ class CongruenceClosure:
                 if q is not None and self._find(q) != self._find(p):
                     work.append((p, q, (_CONG, p, q)))
                 else:
+                    self._journal_sig(sigp)
                     self._sig[sigp] = p
+                self._journal_parents(rb)
                 self._class_parents[rb].append(p)
 
     def _merge_forbidden(self, ra, rb):
         """Merge forbidden sets after root ``ra`` was attached under ``rb``."""
+        self._journal_forbidden(ra)
+        self._journal_forbidden(rb)
         fa = self._forbidden.pop(ra, None)
         fb = self._forbidden.setdefault(rb, {})
         if not fa:
@@ -356,11 +468,14 @@ class CongruenceClosure:
             fb.setdefault(other, pair)
             od = self._forbidden.get(other)
             if od is not None:
+                self._journal_forbidden(other)
                 od.pop(ra, None)
                 od.setdefault(rb, pair)
 
     def _forbid(self, a, b):
         ra, rb = self._find(a), self._find(b)
+        self._journal_forbidden(ra)
+        self._journal_forbidden(rb)
         self._forbidden.setdefault(ra, {})[rb] = (a, b)
         self._forbidden.setdefault(rb, {})[ra] = (a, b)
 
@@ -473,6 +588,93 @@ class CongruenceClosure:
         except ContradictionError:
             self._restore(snap)
             raise
+
+    # -- scoped assumptions (push/pop) -----------------------------------------
+
+    def push(self):
+        """Open a new assumption scope and return the new scope depth.
+
+        Everything asserted or built until the matching :meth:`pop` --
+        equalities, distinct assertions and newly created terms -- belongs
+        to this scope.  Inner scopes may freely reference outer terms.
+        ``push`` is O(1): nothing is copied; mutations are recorded in a
+        per-scope change journal instead.
+        """
+        self._scopes.append(
+            _Scope(len(self._terms), len(self._inputs), len(self._distincts)))
+        return len(self._scopes)
+
+    def pop(self):
+        """Leave the innermost scope, undoing everything asserted in it.
+
+        Equivalence classes, parent signatures, the proof forest and the
+        conflict (distinct) state return to exactly what they were at the
+        matching :meth:`push`.  Terms created inside the scope keep their
+        (never reused) ids but become invalid: passing one to any operation
+        raises :class:`StaleNodeError`, and a structurally identical term
+        built afterwards gets a fresh id.  A scope whose last operation
+        failed with :class:`ContradictionError` can still be popped.
+        Raises :class:`ScopeError` at the base level.
+        """
+        if not self._scopes:
+            raise ScopeError("pop: already at base level; no scope to leave")
+        scope = self._scopes.pop()
+        # Replay the journal: restore every location first written inside
+        # this scope to the value it held at push time.
+        for (kind, key), old in scope.journal.items():
+            if kind == "uf":
+                self._uf[key] = old
+            elif kind == "size":
+                self._size[key] = old
+            elif kind == "pf":
+                self._pf[key] = old
+            elif kind == "sig":
+                if old is _ABSENT:
+                    self._sig.pop(key, None)
+                else:
+                    self._sig[key] = old
+            elif kind == "hc":
+                self._hashcons.pop(key, None)
+            elif kind == "ar":
+                self._arity.pop(key, None)
+            elif kind == "cp":
+                if old is _ABSENT:
+                    self._class_parents.pop(key, None)
+                else:
+                    self._class_parents[key] = old
+            elif kind == "frb":
+                if old is _ABSENT:
+                    self._forbidden.pop(key, None)
+                else:
+                    self._forbidden[key] = old
+        # Tombstone the terms created in the scope: their ids stay reserved
+        # (never reused) but every handle to them is invalid from now on.
+        # The uf/size/pf arrays keep their (now unreachable) entries so
+        # that node ids stay aligned with array indices.
+        n = scope.n_terms
+        newly_dead = 0
+        for i in range(n, len(self._terms)):
+            if self._alive[i]:
+                self._alive[i] = False
+                newly_dead += 1
+        self._live_count -= newly_dead
+        # Truncate the assertion lists to their length at push time.
+        del self._inputs[scope.n_inputs:]
+        del self._distincts[scope.n_distincts:]
+
+    @contextlib.contextmanager
+    def scope(self):
+        """Context manager wrapping :meth:`push`/:meth:`pop`.
+
+        The scope is popped when the ``with`` block exits, even if an
+        operation inside it raised (e.g. :class:`ContradictionError`).
+        Do not call :meth:`pop` manually inside the block.
+        """
+        self.push()
+        try:
+            yield self
+        finally:
+            self.pop()
 
     # -- explanation ------------------------------------------------------------
 
