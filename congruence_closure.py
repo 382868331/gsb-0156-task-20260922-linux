@@ -6,7 +6,8 @@ equality with uninterpreted function symbols:
 * terms are constants or fixed-arity function applications, hash-consed into
   a shared DAG (at most ``max_nodes`` nodes, 5000 by default);
 * congruence is one-directional: equal arguments imply equal results for the
-  same function symbol, but ``f(a) = f(b)`` never implies ``a = b``;
+  same function symbol; ``f(a) = f(b)`` implies ``a = b`` only when ``f``
+  has been declared injective via :meth:`CongruenceClosure.declare_injective`;
 * union-find with a signature table over parent terms (no all-pairs
   comparison);
 * every derived equality keeps its origin (an input equality or a congruence
@@ -43,6 +44,7 @@ DEFAULT_MAX_NODES = 5000
 
 _INPUT = "input"
 _CONG = "cong"
+_INJ = "inj"
 _CONTRADICTION = "contradiction"
 
 
@@ -93,14 +95,17 @@ class ContradictionError(CongruenceError):
     * ``inputs``    -- frozenset of normalized input equalities the proof uses
     * ``distincts`` -- frozenset of normalized distinct assertions
     * ``terms``     -- tuple of ``(func, args)`` indexed by node id
+    * ``injective`` -- frozenset of function symbols declared injective
     """
 
-    def __init__(self, message, proof, inputs, distincts, terms):
+    def __init__(self, message, proof, inputs, distincts, terms,
+                 injective=frozenset()):
         super().__init__(message)
         self.proof = proof
         self.inputs = inputs
         self.distincts = distincts
         self.terms = terms
+        self.injective = injective
 
 
 class _Conflict(Exception):
@@ -151,6 +156,8 @@ class CongruenceClosure:
         self._forbidden = {}        # uf root -> {other root: original pair}
         self._inputs = []           # asserted equalities, in order
         self._distincts = []        # asserted distinct pairs, in order
+        self._injective = set()     # function symbols declared injective
+        self._class_inj = {}        # uf root -> {injective func: a node applying it}
 
     # -- read-only views ----------------------------------------------------
 
@@ -176,6 +183,11 @@ class CongruenceClosure:
     def distinct_assertions(self):
         """Asserted distinct pairs as a tuple of ``(a, b)`` pairs."""
         return tuple(self._distincts)
+
+    @property
+    def injective_functions(self):
+        """Tuple of function symbols declared injective (sorted)."""
+        return tuple(sorted(self._injective))
 
     def term_of(self, nid):
         """Return ``(func, arg_ids)`` for node ``nid``."""
@@ -243,12 +255,14 @@ class CongruenceClosure:
             len(self._terms),
             dict(self._hashcons),
             dict(self._arity),
+            set(self._injective),
+            {root: dict(d) for root, d in self._class_inj.items()},
         )
 
     def _restore(self, snap):
         (self._uf, self._size, self._pf, self._sig, self._class_parents,
          self._forbidden, self._inputs, self._distincts, nterms,
-         self._hashcons, self._arity) = snap
+         self._hashcons, self._arity, self._injective, self._class_inj) = snap
         del self._terms[nterms:]
 
     # -- term construction ----------------------------------------------------
@@ -296,6 +310,8 @@ class CongruenceClosure:
             self._class_parents[nid] = []
             for a in dict.fromkeys(arg_tuple):
                 self._class_parents[self._find(a)].append(nid)
+            if func in self._injective:
+                self._class_inj[nid] = {func: nid}
             sig = (func, tuple(self._find(a) for a in arg_tuple))
             other = self._sig.get(sig)
             if other is None:
@@ -333,6 +349,7 @@ class CongruenceClosure:
             self._uf[ra] = rb
             self._size[rb] += self._size[ra]
             self._merge_forbidden(ra, rb)
+            self._merge_injective(ra, rb, work)
             # Recompute signatures of parents of the merged-away class.
             for p in self._class_parents.pop(ra, ()):
                 fp, argsp = self._terms[p]
@@ -343,6 +360,27 @@ class CongruenceClosure:
                 else:
                     self._sig[sigp] = p
                 self._class_parents[rb].append(p)
+
+    def _merge_injective(self, ra, rb, work):
+        """Merge injective-application tables after ``ra`` joined ``rb``.
+
+        If both classes hold an application of the same injective function
+        ``f``, their arguments are pairwise merged (backward propagation).
+        """
+        da = self._class_inj.pop(ra, None)
+        if not da:
+            return
+        db = self._class_inj.setdefault(rb, {})
+        for func, p in da.items():
+            q = db.get(func)
+            if q is None:
+                db[func] = p
+                continue
+            _, args_p = self._terms[p]
+            _, args_q = self._terms[q]
+            for k, (x, y) in enumerate(zip(args_p, args_q)):
+                if self._find(x) != self._find(y):
+                    work.append((x, y, (_INJ, p, q, k)))
 
     def _merge_forbidden(self, ra, rb):
         """Merge forbidden sets after root ``ra`` was attached under ``rb``."""
@@ -365,6 +403,44 @@ class CongruenceClosure:
         self._forbidden.setdefault(rb, {})[ra] = (a, b)
 
     # -- assertions ------------------------------------------------------------
+
+    def declare_injective(self, func):
+        """Declare function symbol ``func`` injective.
+
+        Afterwards, whenever two applications of ``func`` become equal, their
+        arguments are merged position by position (backward propagation),
+        which may chain with ordinary congruence.  Existing applications are
+        handled retroactively.  Atomic: if the retroactive merges contradict
+        a distinct pair, a :class:`ContradictionError` (with proof) is raised
+        and the declaration is rolled back.  Re-declaring is a no-op.
+        """
+        if not isinstance(func, str) or func == "":
+            raise ValidationError(
+                f"declare_injective: func must be a non-empty str, "
+                f"got {func!r}")
+        if func in self._injective:
+            return
+        snap = self._snapshot()
+        try:
+            self._injective.add(func)
+            for nid, (f, args) in enumerate(self._terms):
+                if f != func:
+                    continue
+                root = self._find(nid)
+                table = self._class_inj.setdefault(root, {})
+                other = table.get(func)
+                if other is None:
+                    table[func] = nid
+                    continue
+                _, other_args = self._terms[other]
+                for k, (x, y) in enumerate(zip(args, other_args)):
+                    self._merge(x, y, (_INJ, nid, other, k))
+        except _Conflict as conflict:
+            error = self._make_contradiction(
+                conflict.pair, edge=conflict.edge)
+            self._restore(snap)
+            raise error from None
+
 
     def _make_contradiction(self, pair, edge=None, extra_distinct=()):
         """Build a ContradictionError for distinct pair ``(x, y)``.
@@ -398,6 +474,7 @@ class CongruenceClosure:
             inputs=frozenset(_norm_pair(p, q) for p, q in self._inputs),
             distincts=frozenset(distincts),
             terms=tuple(self._terms),
+            injective=frozenset(self._injective),
         )
 
     def _assert_equal_inner(self, a, b):
@@ -479,10 +556,12 @@ class CongruenceClosure:
     def explain(self, a, b):
         """Return a verifiable proof that ``a = b``.
 
-        The proof is a tuple of edge proofs forming a chain from ``a`` to
-        ``b``; each edge is ``("input", x, y)`` or
-        ``("cong", t1, t2, (subproof_per_argument, ...))``.  Raises
-        :class:`NotEqualError` if the terms are not equal.
+    The proof is a tuple of edge proofs forming a chain from ``a`` to
+    ``b``; each edge is ``("input", x, y)``,
+    ``("cong", t1, t2, (subproof_per_argument, ...))`` or
+    ``("inj", t1, t2, k, premise_subproof)`` (an injective step deriving
+    ``arg_k(t1) = arg_k(t2)`` from a subproof of ``t1 = t2``).  Raises
+    :class:`NotEqualError` if the terms are not equal.
         """
         self._check_node(a, "explain: a")
         self._check_node(b, "explain: b")
@@ -499,7 +578,12 @@ class CongruenceClosure:
         key = _norm_pair(a, b)
         cached = memo.get(key)
         if cached is not None:
-            return cached
+            stored_from, stored_proof = cached
+            # Chains are directed; a cached chain for the reversed pair
+            # reads backwards (every edge kind is direction-symmetric).
+            if stored_from == a:
+                return stored_proof
+            return tuple(reversed(stored_proof))
         # Ancestors of a in the proof forest (root included, mapped to None).
         anc = {}
         cur = a
@@ -527,12 +611,15 @@ class CongruenceClosure:
             cur = parent
         chain.extend(reversed(back))
         proof = tuple(self._expand(reason, memo) for reason in chain)
-        memo[key] = proof
+        memo[key] = (a, proof)
         return proof
 
     def _expand(self, reason, memo):
         if reason[0] == _INPUT:
             return (_INPUT, reason[1], reason[2])
+        if reason[0] == _INJ:
+            _, p, q, k = reason
+            return (_INJ, p, q, k, self._explain_chain(p, q, memo))
         _, p, q = reason
         _, args_p = self._terms[p]
         _, args_q = self._terms[q]
@@ -554,16 +641,17 @@ def _check_proof_id(nid, terms, where):
         raise ProofError(f"{where}: unknown node id {nid}")
 
 
-def _verify_chain(proof, start, input_set, terms, where):
+def _verify_chain(proof, start, input_set, injective_set, terms, where):
     if not isinstance(proof, tuple):
         raise ProofError(f"{where}: proof chain must be a tuple")
     cur = start
     for i, edge in enumerate(proof):
-        cur = _verify_edge(edge, cur, input_set, terms, f"{where}[{i}]")
+        cur = _verify_edge(edge, cur, input_set, injective_set, terms,
+                           f"{where}[{i}]")
     return cur
 
 
-def _verify_edge(edge, cur, input_set, terms, where):
+def _verify_edge(edge, cur, input_set, injective_set, terms, where):
     if not isinstance(edge, tuple) or not edge:
         raise ProofError(f"{where}: edge must be a non-empty tuple")
     kind = edge[0]
@@ -608,21 +696,70 @@ def _verify_edge(edge, cur, input_set, terms, where):
                 f"{where}: congruence edge ({t1}, {t2}) does not continue "
                 f"the chain at {cur}")
         for k, (x, y, sub) in enumerate(zip(args1, args2, subs)):
-            end = _verify_chain(sub, x, input_set, terms, f"{where}.arg{k}")
+            end = _verify_chain(sub, x, input_set, injective_set, terms,
+                                f"{where}.arg{k}")
             if end != y:
                 raise ProofError(
                     f"{where}.arg{k}: subproof ends at {end}, expected {y}")
         return nxt
+    if kind == _INJ:
+        if len(edge) != 5:
+            raise ProofError(f"{where}: injective edge must have 5 elements")
+        _, t1, t2, k, sub = edge
+        _check_proof_id(t1, terms, where)
+        _check_proof_id(t2, terms, where)
+        f1, args1 = terms[t1]
+        f2, args2 = terms[t2]
+        if f1 != f2:
+            raise ProofError(
+                f"{where}: injective step needs the same function symbol, "
+                f"got {f1!r} and {f2!r}")
+        if f1 not in injective_set:
+            raise ProofError(
+                f"{where}: function {f1!r} was not declared injective")
+        if isinstance(k, bool) or not isinstance(k, int) \
+                or not 0 <= k < len(args1):
+            raise ProofError(
+                f"{where}: invalid argument index {k!r} for arity "
+                f"{len(args1)}")
+        x, y = args1[k], args2[k]
+        if cur == x:
+            nxt = y
+        elif cur == y:
+            nxt = x
+        else:
+            raise ProofError(
+                f"{where}: injective edge derives ({x}, {y}) which does "
+                f"not continue the chain at {cur}")
+        end = _verify_chain(sub, t1, input_set, injective_set, terms,
+                            f"{where}.premise")
+        if end != t2:
+            raise ProofError(
+                f"{where}.premise: premise subproof ends at {end}, "
+                f"expected {t2}")
+        return nxt
     raise ProofError(f"{where}: unknown edge kind {kind!r}")
 
 
-def verify_proof(proof, a, b, inputs, terms):
+def _normalize_injective(injective, where):
+    injective_set = set()
+    for func in injective:
+        if not isinstance(func, str) or func == "":
+            raise ProofError(
+                f"{where}: injective symbol must be a non-empty str, "
+                f"got {func!r}")
+        injective_set.add(func)
+    return injective_set
+
+
+def verify_proof(proof, a, b, inputs, terms, injective=()):
     """Independently verify that ``proof`` derives ``a = b``.
 
     ``inputs`` is the set of asserted input equalities (pairs of node ids)
-    the proof may appeal to; ``terms`` maps node ids to ``(func, args)``.
-    Returns ``True`` on success, raises :class:`ProofError` (locating the
-    failing step) otherwise.
+    the proof may appeal to; ``terms`` maps node ids to ``(func, args)``;
+    ``injective`` is the set of function symbols declared injective that
+    ``inj`` steps may appeal to.  Returns ``True`` on success, raises
+    :class:`ProofError` (locating the failing step) otherwise.
     """
     terms = tuple(terms)
     _check_proof_id(a, terms, "verify_proof: a")
@@ -637,13 +774,14 @@ def verify_proof(proof, a, b, inputs, terms):
         _check_proof_id(x, terms, "verify_proof: inputs")
         _check_proof_id(y, terms, "verify_proof: inputs")
         input_set.add(_norm_pair(x, y))
-    end = _verify_chain(proof, a, input_set, terms, "proof")
+    injective_set = _normalize_injective(injective, "verify_proof")
+    end = _verify_chain(proof, a, input_set, injective_set, terms, "proof")
     if end != b:
         raise ProofError(f"proof chain ends at {end}, expected {b}")
     return True
 
 
-def verify_contradiction(proof, inputs, distincts, terms):
+def verify_contradiction(proof, inputs, distincts, terms, injective=()):
     """Independently verify a contradiction proof.
 
     ``proof`` must be ``("contradiction", equality_proof, (x, y))`` where
@@ -672,7 +810,7 @@ def verify_contradiction(proof, inputs, distincts, terms):
     if _norm_pair(x, y) not in distinct_set:
         raise ProofError(
             f"({x}, {y}) is not among the asserted distinct pairs")
-    verify_proof(eq_proof, x, y, inputs, terms)
+    verify_proof(eq_proof, x, y, inputs, terms, injective)
     return True
 
 
@@ -709,6 +847,14 @@ def proof_to_str(proof, terms):
                 lines.append(
                     f"{indent}input: {term_to_str(edge[1], terms)}"
                     f" = {term_to_str(edge[2], terms)}")
+            elif edge[0] == _INJ:
+                _, t1, t2, k, sub = edge
+                lines.append(
+                    f"{indent}injective: argument {k} of "
+                    f"{term_to_str(t1, terms)} = {term_to_str(t2, terms)}")
+                if sub:
+                    lines.append(f"{indent}  premise:")
+                    emit_chain(sub, indent + "    ")
             else:
                 _, t1, t2, subs = edge
                 lines.append(
