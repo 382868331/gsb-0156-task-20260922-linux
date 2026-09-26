@@ -64,6 +64,54 @@ def reference_closure(terms, equalities):
     return find
 
 
+def _enumerate_partitions(n):
+    """Yield block-id tuples for every set partition of range(n)."""
+    labels = [0] * n
+
+    def generate(i, max_label):
+        if i == n:
+            yield tuple(labels)
+            return
+        for label in range(max_label + 2):
+            labels[i] = label
+            yield from generate(i + 1, max(max_label, label))
+
+    yield from generate(0, -1)
+
+
+def enumerate_models(terms, equalities, distincts, injectives):
+    """Enumerate finite quotient models over an existing finite term set."""
+    n = len(terms)
+    injective = set(injectives)
+    models = []
+    for blocks in _enumerate_partitions(n):
+        if any(blocks[a] != blocks[b] for a, b in equalities):
+            continue
+        if any(blocks[a] == blocks[b] for a, b in distincts):
+            continue
+        valid = True
+        for i in range(n):
+            fi, ai = terms[i]
+            for j in range(i + 1, n):
+                fj, aj = terms[j]
+                if fi != fj:
+                    continue
+                args_equal = all(blocks[x] == blocks[y]
+                                 for x, y in zip(ai, aj))
+                outputs_equal = blocks[i] == blocks[j]
+                if args_equal and not outputs_equal:
+                    valid = False
+                    break
+                if fi in injective and outputs_equal and not args_equal:
+                    valid = False
+                    break
+            if not valid:
+                break
+        if valid:
+            models.append(blocks)
+    return models
+
+
 def build_random_instance(rng, n_consts=3, n_terms=9, n_eqs=4):
     """Deterministically (via rng) build a small random DAG + equalities.
 
@@ -427,6 +475,257 @@ class TestValidation(unittest.TestCase):
             CongruenceClosure(max_nodes=-1)
         with self.assertRaises(ValidationError):
             CongruenceClosure(max_nodes=1.5)
+
+
+class TestInjectiveReasoning(unittest.TestCase):
+    def test_unary_injectivity_reverses_argument_equality(self):
+        cc = CongruenceClosure()
+        a = cc.add_term("a")
+        b = cc.add_term("b")
+        fa = cc.add_term("f", [a])
+        fb = cc.add_term("f", [b])
+        cc.declare_injective("f")
+        cc.assert_equal(fa, fb)
+        self.assertTrue(cc.are_equal(a, b))
+        proof = cc.explain(a, b)
+        self.assertEqual(proof[0][0], "inject")
+        self.assertEqual(proof[0][4], (("input", fa, fb),))
+        self.assertTrue(verify_proof(
+            proof, a, b, cc.input_equalities, cc.terms,
+            cc.injective_symbols))
+
+    def test_undeclared_function_keeps_one_way_congruence(self):
+        cc = CongruenceClosure()
+        a = cc.add_term("a")
+        b = cc.add_term("b")
+        fa = cc.add_term("f", [a])
+        fb = cc.add_term("f", [b])
+        ga = cc.add_term("g", [a])
+        gb = cc.add_term("g", [b])
+        cc.declare_injective("g")
+        cc.assert_equal(fa, fb)
+        self.assertFalse(cc.are_equal(a, b))
+        self.assertFalse(cc.are_equal(ga, gb))
+        with self.assertRaises(NotEqualError):
+            cc.explain(a, b)
+
+    def test_binary_injectivity_derives_each_position(self):
+        cc = CongruenceClosure()
+        a, b, c, d = (cc.add_term(n) for n in "abcd")
+        p = cc.add_term("f", [a, b])
+        q = cc.add_term("f", [c, d])
+        cc.declare_injective("f")
+        cc.assert_equal(p, q)
+        self.assertTrue(cc.are_equal(a, c))
+        self.assertTrue(cc.are_equal(b, d))
+        for x, y in ((a, c), (b, d)):
+            self.assertTrue(verify_proof(
+                cc.explain(x, y), x, y, cc.input_equalities, cc.terms,
+                cc.injective_symbols))
+
+    def test_binary_argument_swap_is_not_an_equality_model(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term("a"), cc.add_term("b")
+        ab = cc.add_term("f", [a, b])
+        ba = cc.add_term("f", [b, a])
+        cc.declare_injective("f")
+        cc.assert_equal(ab, ba)
+        self.assertTrue(cc.are_equal(a, b))
+        models = enumerate_models(
+            cc.terms, ((ab, ba),), (), cc.injective_symbols)
+        self.assertTrue(models)
+        self.assertTrue(all(model[a] == model[b] for model in models))
+
+    def test_nested_forward_and_inverse_chain(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term("a"), cc.add_term("b")
+        fa, fb = cc.add_term("f", [a]), cc.add_term("f", [b])
+        ga, gb = cc.add_term("g", [fa]), cc.add_term("g", [fb])
+        h1, h2 = cc.add_term("h", [ga]), cc.add_term("h", [gb])
+        cc.declare_injective("f")
+        cc.declare_injective("g")
+        cc.declare_injective("h")
+        cc.assert_equal(h1, h2)
+        self.assertTrue(cc.are_equal(a, b))
+        proof = cc.explain(a, b)
+        self.assertTrue(verify_proof(
+            proof, a, b, cc.input_equalities, cc.terms,
+            cc.injective_symbols))
+        kinds = []
+        stack = [proof]
+        while stack:
+            chain = stack.pop()
+            for edge in chain:
+                kinds.append(edge[0])
+                if edge[0] == "cong":
+                    stack.extend(sub for sub in edge[3] if sub)
+                elif edge[0] == "inject":
+                    stack.append(edge[4])
+        self.assertIn("inject", kinds)
+        self.assertIn("input", kinds)
+
+    def test_forward_and_inverse_propagation_chain(self):
+        cc = CongruenceClosure()
+        a, b, c, d = (cc.add_term(n) for n in "abcd")
+        fb, fd = cc.add_term("f", [b]), cc.add_term("f", [d])
+        ga, gc = cc.add_term("g", [a]), cc.add_term("g", [c])
+        cc.declare_injective("f")
+        cc.assert_equal(a, b)
+        cc.assert_equal(c, a)
+        cc.assert_equal(ga, fb)
+        cc.assert_equal(fd, gc)
+        self.assertTrue(cc.are_equal(a, d))
+        self.assertTrue(verify_proof(
+            cc.explain(a, d), a, d, cc.input_equalities, cc.terms,
+            cc.injective_symbols))
+
+    def test_declaration_after_existing_equality_closes_immediately(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term("a"), cc.add_term("b")
+        fa, fb = cc.add_term("f", [a]), cc.add_term("f", [b])
+        cc.assert_equal(fa, fb)
+        self.assertFalse(cc.are_equal(a, b))
+        cc.declare_injective("f")
+        self.assertTrue(cc.are_equal(a, b))
+        self.assertIn("f", cc.injective_symbols)
+        self.assertTrue(verify_proof(
+            cc.explain(a, b), a, b, cc.input_equalities, cc.terms,
+            cc.injective_symbols))
+
+    def test_injective_conflict_with_distinct_is_verifiable(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term("a"), cc.add_term("b")
+        fa, fb = cc.add_term("f", [a]), cc.add_term("f", [b])
+        cc.declare_injective("f")
+        cc.assert_distinct(a, b)
+        with self.assertRaises(ContradictionError) as ctx:
+            cc.assert_equal(fa, fb)
+        err = ctx.exception
+        self.assertIn("f", err.injectives)
+        self.assertTrue(verify_contradiction(
+            err.proof, err.inputs, err.distincts, err.terms,
+            err.injectives))
+        self.assertFalse(cc.are_equal(fa, fb))
+        self.assertFalse(cc.are_equal(a, b))
+
+    def test_late_declaration_conflict_rolls_back_declaration(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term("a"), cc.add_term("b")
+        fa, fb = cc.add_term("f", [a]), cc.add_term("f", [b])
+        cc.assert_equal(fa, fb)
+        cc.assert_distinct(a, b)
+        with self.assertRaises(ContradictionError) as ctx:
+            cc.declare_injective("f")
+        err = ctx.exception
+        self.assertTrue(verify_contradiction(
+            err.proof, err.inputs, err.distincts, err.terms,
+            err.injectives))
+        self.assertNotIn("f", cc.injective_symbols)
+        self.assertFalse(cc.are_equal(a, b))
+
+    def test_verifier_rejects_undeclared_injective_step(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term("a"), cc.add_term("b")
+        fa, fb = cc.add_term("f", [a]), cc.add_term("f", [b])
+        forged = (("inject", fa, fb, 0, (("input", fa, fb),)),)
+        with self.assertRaises(ProofError):
+            verify_proof(forged, a, b, ((fa, fb),), cc.terms, ())
+
+    def test_different_function_images_are_not_identified(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term("a"), cc.add_term("b")
+        fa = cc.add_term("f", [a])
+        gb = cc.add_term("g", [b])
+        cc.declare_injective("f")
+        cc.declare_injective("g")
+        cc.assert_equal(fa, gb)
+        self.assertFalse(cc.are_equal(a, b))
+
+    def test_small_exhaustive_models_match_oracle(self):
+        cc = CongruenceClosure()
+        a, b, c = (cc.add_term(n) for n in "abc")
+        fa = cc.add_term("f", [a])
+        fb = cc.add_term("f", [b])
+        fc = cc.add_term("f", [c])
+        cc.declare_injective("f")
+        cases = [
+            (((fa, fb),), ()),
+            (((fa, fb), (b, c)), ()),
+            (((fa, fb),), ((a, c),)),
+            (((fa, fb),), ((a, b),)),
+        ]
+        for equalities, distincts in cases:
+            models = enumerate_models(cc.terms, equalities, distincts, ("f",))
+            fresh = CongruenceClosure()
+            nodes = [fresh.add_term(func, args)
+                     for func, args in cc.terms]
+            fresh.declare_injective("f")
+            try:
+                for x, y in equalities:
+                    fresh.assert_equal(nodes[x], nodes[y])
+                for x, y in distincts:
+                    fresh.assert_distinct(nodes[x], nodes[y])
+                satisfiable = True
+            except ContradictionError:
+                satisfiable = False
+            self.assertEqual(satisfiable, bool(models))
+            if satisfiable:
+                for i in range(cc.node_count):
+                    for j in range(i + 1, cc.node_count):
+                        self.assertEqual(
+                            fresh.are_equal(nodes[i], nodes[j]),
+                            all(m[i] == m[j] for m in models))
+
+    def test_random_small_instances_match_exhaustive_models(self):
+        funcs = (("f", 1), ("g", 2), ("h", 1))
+        for seed in range(25):
+            rng = random.Random(1000 + seed)
+            terms = [("c0", ()), ("c1", ()), ("c2", ())]
+            while len(terms) < 8:
+                func, arity = rng.choice(funcs)
+                args = tuple(rng.randrange(len(terms)) for _ in range(arity))
+                term = (func, args)
+                if term not in terms:
+                    terms.append(term)
+            injective = {name for name, _ in funcs if rng.random() < 0.7}
+            equalities = []
+            for _ in range(3):
+                a, b = rng.randrange(8), rng.randrange(8)
+                if a != b:
+                    equalities.append((a, b))
+            distincts = []
+            for _ in range(2):
+                a, b = rng.randrange(8), rng.randrange(8)
+                if a != b:
+                    distincts.append((a, b))
+            models = enumerate_models(terms, equalities, distincts,
+                                      injective)
+
+            cc = CongruenceClosure()
+            nodes = [cc.add_term(func, args) for func, args in terms]
+            satisfiable = True
+            try:
+                for func in injective:
+                    cc.declare_injective(func)
+                for a, b in equalities:
+                    cc.assert_equal(nodes[a], nodes[b])
+                for a, b in distincts:
+                    cc.assert_distinct(nodes[a], nodes[b])
+            except ContradictionError:
+                satisfiable = False
+            self.assertEqual(satisfiable, bool(models), f"seed={seed}")
+            if not satisfiable:
+                continue
+            for i in range(8):
+                for j in range(i + 1, 8):
+                    expected = all(m[i] == m[j] for m in models)
+                    self.assertEqual(cc.are_equal(nodes[i], nodes[j]),
+                                     expected, f"seed={seed} pair=({i},{j})")
+                    if expected:
+                        self.assertTrue(verify_proof(
+                            cc.explain(nodes[i], nodes[j]),
+                            nodes[i], nodes[j], cc.input_equalities,
+                            cc.terms, cc.injective_symbols))
 
 
 class TestDeepTerms(unittest.TestCase):
