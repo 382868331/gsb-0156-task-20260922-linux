@@ -1,8 +1,8 @@
 """Deterministic offline demo of the congruence_closure module.
 
-Runs a normal scenario (multi-layer congruence + verified proof) and then
-deliberately triggers two rejection boundaries (a contradiction with
-batch rollback, and invalid input).  No sleeps, no recorded output.
+Runs normal scenarios (multi-layer congruence and source revocation), then
+deliberately triggers two rejection boundaries (a contradiction with batch
+rollback, and invalid input).  No sleeps, no recorded output.
 """
 
 from congruence_closure import (
@@ -48,8 +48,26 @@ def normal_scenario():
           cc2.are_equal(x, y), "(must be False)")
 
 
+def revocation_scenario():
+    print("\n=== 2. Source revocation keeps later evidence ===")
+    cc = CongruenceClosure()
+    a, b, c = (cc.add_term(n) for n in "abc")
+    cc.assert_equal(a, b, source="early")
+    cc.assert_equal(b, c, source="later")
+    print("before revoke: a = c is", cc.are_equal(a, c))
+
+    removed = cc.revoke_source("early")
+    print(f"removed {removed} equality from source 'early'")
+    print("after revoke: a = b is", cc.are_equal(a, b),
+          "; b = c is", cc.are_equal(b, c), "; a = c is", cc.are_equal(a, c))
+    proof = cc.explain(b, c)
+    print(proof_to_str(proof, cc.terms))
+    print("remaining proof independently verifies:",
+          verify_proof(proof, b, c, cc.input_equalities, cc.terms))
+
+
 def rejection_scenario():
-    print("\n=== 2. Rejection boundary: batch conflict, rolled back ===")
+    print("\n=== 3. Rejection boundary: batch conflict, rolled back ===")
     cc = CongruenceClosure()
     a = cc.add_term("a")
     b = cc.add_term("b")
@@ -69,7 +87,7 @@ def rejection_scenario():
           "(must be False); f(a) = f(b) is", cc.are_equal(fa, fb),
           "(must be False)")
 
-    print("\n=== 3. Rejection boundary: invalid input is located ===")
+    print("\n=== 4. Rejection boundary: invalid input is located ===")
     try:
         cc.assert_equal(a, True)  # bool is not a valid node id
     except ValidationError as err:
@@ -78,6 +96,7 @@ def rejection_scenario():
 
 def main():
     normal_scenario()
+    revocation_scenario()
     rejection_scenario()
     print("\ndemo finished.")
 

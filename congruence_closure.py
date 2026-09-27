@@ -150,6 +150,7 @@ class CongruenceClosure:
         self._class_parents = {}    # uf root -> [parent node ids]
         self._forbidden = {}        # uf root -> {other root: original pair}
         self._inputs = []           # asserted equalities, in order
+        self._input_sources = []    # source label for each asserted equality
         self._distincts = []        # asserted distinct pairs, in order
 
     # -- read-only views ----------------------------------------------------
@@ -171,6 +172,11 @@ class CongruenceClosure:
     def input_equalities(self):
         """Asserted input equalities as a tuple of ``(a, b)`` pairs."""
         return tuple(self._inputs)
+
+    @property
+    def input_sources(self):
+        """Source labels aligned with :attr:`input_equalities`."""
+        return tuple(self._input_sources)
 
     @property
     def distinct_assertions(self):
@@ -239,6 +245,7 @@ class CongruenceClosure:
             {root: lst[:] for root, lst in self._class_parents.items()},
             {root: dict(d) for root, d in self._forbidden.items()},
             list(self._inputs),
+            list(self._input_sources),
             list(self._distincts),
             len(self._terms),
             dict(self._hashcons),
@@ -247,9 +254,31 @@ class CongruenceClosure:
 
     def _restore(self, snap):
         (self._uf, self._size, self._pf, self._sig, self._class_parents,
-         self._forbidden, self._inputs, self._distincts, nterms,
+         self._forbidden, self._inputs, self._input_sources,
+         self._distincts, nterms,
          self._hashcons, self._arity) = snap
         del self._terms[nterms:]
+
+    def _reset_derived_state(self):
+        """Rebuild empty union/proof/index structures over the fixed DAG."""
+        self._uf = list(range(len(self._terms)))
+        self._size = [1] * len(self._terms)
+        self._pf = [None] * len(self._terms)
+        self._sig = {}
+        self._class_parents = {nid: [] for nid in range(len(self._terms))}
+        self._forbidden = {}
+        for nid, (func, args) in enumerate(self._terms):
+            signature = (func, tuple(args))
+            self._sig[signature] = nid
+            for arg in dict.fromkeys(args):
+                self._class_parents[arg].append(nid)
+
+    def _replay_assertions(self, equalities):
+        """Recompute congruence from distinct constraints and equalities."""
+        for a, b in self._distincts:
+            self._forbid(a, b)
+        for a, b in equalities:
+            self._merge(a, b, (_INPUT, a, b))
 
     # -- term construction ----------------------------------------------------
 
@@ -400,31 +429,68 @@ class CongruenceClosure:
             terms=tuple(self._terms),
         )
 
-    def _assert_equal_inner(self, a, b):
+    def _assert_equal_inner(self, a, b, source=None):
+        self._inputs.append((a, b))
+        self._input_sources.append(source)
         if self._find(a) == self._find(b):
             return
-        self._inputs.append((a, b))
         try:
             self._merge(a, b, (_INPUT, a, b))
         except _Conflict as conflict:
             raise self._make_contradiction(
                 conflict.pair, edge=conflict.edge) from None
 
-    def assert_equal(self, a, b):
+    def assert_equal(self, a, b, source=None):
         """Assert ``a = b`` and close under congruence.
 
         Atomic: if the assertion contradicts a distinct pair, a
         :class:`ContradictionError` carrying a verifiable proof is raised
         and the structure is left exactly as before the call.
+
+        ``source`` is an optional caller-owned label.  All equalities bearing
+        the same label can later be removed together with
+        :meth:`revoke_source`; use a unique label to identify one assertion.
         """
         self._check_node(a, "assert_equal: a")
         self._check_node(b, "assert_equal: b")
         snap = self._snapshot()
         try:
-            self._assert_equal_inner(a, b)
+            self._assert_equal_inner(a, b, source)
         except ContradictionError:
             self._restore(snap)
             raise
+
+    def revoke_source(self, source):
+        """Remove every active equality assertion labeled ``source``.
+
+        Unlike restoring an old snapshot, all other assertions remain active,
+        including equalities submitted after the removed one.  Derived classes
+        and proofs are recomputed from the remaining input equalities, while
+        the term DAG and distinct assertions are retained.  Returns the number
+        of removed equality assertions; a return value of zero is a no-op.
+        """
+        remaining = [
+            (pair, label)
+            for pair, label in zip(self._inputs, self._input_sources)
+            if label != source
+        ]
+        removed = len(self._inputs) - len(remaining)
+        if removed == 0:
+            return 0
+        snap = self._snapshot()
+        try:
+            self._inputs = [pair for pair, _ in remaining]
+            self._input_sources = [label for _, label in remaining]
+            self._reset_derived_state()
+            self._replay_assertions(self._inputs)
+        except _Conflict:
+            self._restore(snap)
+            raise AssertionError(
+                "revoke_source: internal error: removing equalities "
+                "introduced a distinctness contradiction") from None
+        return removed
+
+    retract_source = revoke_source
 
     def _assert_distinct_inner(self, a, b):
         if self._find(a) == self._find(b):
@@ -453,21 +519,28 @@ class CongruenceClosure:
         """
         ops_list = list(ops)
         for i, op in enumerate(ops_list):
-            if not isinstance(op, (tuple, list)) or len(op) != 3:
+            if not isinstance(op, (tuple, list)) or len(op) not in (3, 4):
                 raise ValidationError(
-                    f"apply_batch: op {i} must be a ('='|'!=', a, b) triple, "
+                    f"apply_batch: op {i} must be a ('='|'!=', a, b[, "
+                    f"source]) tuple, "
                     f"got {op!r}")
             if op[0] not in ("=", "!="):
                 raise ValidationError(
                     f"apply_batch: op {i} has unknown relation {op[0]!r}; "
                     f"expected '=' or '!='")
+            if len(op) == 4 and op[0] != "=":
+                raise ValidationError(
+                    f"apply_batch: op {i}: a source label is supported only "
+                    f"for '=', not for {op[0]!r}")
             self._check_node(op[1], f"apply_batch: op {i} left operand")
             self._check_node(op[2], f"apply_batch: op {i} right operand")
         snap = self._snapshot()
         try:
-            for rel, a, b in ops_list:
+            for op in ops_list:
+                rel, a, b = op[0], op[1], op[2]
+                source = op[3] if len(op) == 4 else None
                 if rel == "=":
-                    self._assert_equal_inner(a, b)
+                    self._assert_equal_inner(a, b, source)
                 else:
                     self._assert_distinct_inner(a, b)
         except ContradictionError:

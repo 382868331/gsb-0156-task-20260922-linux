@@ -22,15 +22,17 @@ from congruence_closure import CongruenceClosure, verify_proof, verify_contradic
 cc = CongruenceClosure(max_nodes=5000)   # max_nodes 可配，默认 5000
 a  = cc.add_term("a")                    # 常量 = 零元函数应用，返回节点 id（int）
 fa = cc.add_term("f", [a])               # 函数应用；结构相同的项被 hash-cons 到同一 id
-cc.assert_equal(a, b)                    # 断言等式并做同余闭包；冲突抛 ContradictionError
+cc.assert_equal(a, b, source="rule-42")  # 断言等式，可用来源标签之后撤销；source 可省略
 cc.assert_distinct(a, b)                 # 断言不等；已相等则抛 ContradictionError
-cc.apply_batch([("=", x, y), ("!=", z, w)])  # 批次断言，任一冲突则整批回滚
+cc.revoke_source("rule-42")              # 删除该来源的所有等式并重算其他依据，返回删除条数
+cc.apply_batch([("=", x, y, "rule-1"), ("!=", z, w)])  # 批次断言，任一冲突则整批回滚
 cc.are_equal(x, y)                       # 查询当前闭包中是否相等
 proof = cc.explain(x, y)                 # 相等则返回证明，否则抛 NotEqualError
 verify_proof(proof, x, y, cc.input_equalities, cc.terms)   # 独立验证，返回 True 或抛 ProofError
 ```
 
 只读视图：`cc.terms`（节点 id → `(func, arg_ids)`）、`cc.input_equalities`、
+`cc.input_sources`（与 `cc.input_equalities` 对齐；未提供来源时为 `None`）、
 `cc.distinct_assertions`、`cc.node_count`、`cc.max_nodes`、`cc.term_of(nid)`。
 辅助：`term_to_str(nid, terms)`、`proof_to_str(proof, terms)` 用于打印。
 
@@ -52,6 +54,11 @@ verify_proof(proof, x, y, cc.input_equalities, cc.terms)   # 独立验证，返�
 - **hash-consing**：结构相同的项共享同一节点 id（共享 DAG）。
 - **原子性**：`assert_equal` / `assert_distinct` / `add_term` / `apply_batch` 均为原子操作；
   冲突时抛 `ContradictionError` 并回滚该操作（批次则回滚整批），不留部分变更。
+- **按来源撤销**：`revoke_source(source)` 只删除带该标签的等式，不回滚之后提交的其他等式。
+  重算时保留已有项 DAG 和 distinct 约束，从剩余等式重新构造并查集、证明森林与签名索引；
+  仍有其他等式或同余依据支持的关系保留，只由被删除来源推出的关系消失。重算后的证明只能引用
+  当前 `cc.input_equalities` 中的来源。若已有 distinct 因删除等式而恢复可满足，之后可继续添加
+  原本会冲突的等式。同一来源可标记多条等式，撤销时一次性全部删除；未知来源返回 `0` 且无变化。
 - **错误语义**（均可定位到具体参数，不静默纠正）：
   - `ValidationError`：非法参数（节点 id 非 int、为 bool、为 float 含 NaN/Inf；
     函数符非非空字符串；批次 op 格式错误并标注下标等）。
@@ -75,6 +82,8 @@ verify_proof(proof, x, y, cc.input_equalities, cc.terms)   # 独立验证，返�
 - **回滚**：每次变更操作前做状态快照（并查集、签名表、父表、forbidden 表、
   输入/不等列表等），失败时整体恢复。快照是该操作状态量的 O(n) 复制，
   换来实现的简单与回滚的绝对可靠；5000 节点上限下代价可忽略。
+- **按来源重算**：撤销不是旧快照覆盖。它先过滤输入等式，再在固定 DAG 上清空派生结构并按剩余输入
+  重新闭包；即使某条等式加入时因已有结论而成为冗余等式，也会作为潜在替代依据保留到撤销重算。
 - **递归深度**：`explain` / 验证器按项深度递归，必要时上调
   `sys.setrecursionlimit`（只升不降，界为 `4 * 节点数 + 100`）。
 

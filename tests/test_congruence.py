@@ -64,7 +64,8 @@ def reference_closure(terms, equalities):
     return find
 
 
-def build_random_instance(rng, n_consts=3, n_terms=9, n_eqs=4):
+def build_random_instance(rng, n_consts=3, n_terms=9, n_eqs=4,
+                          source_prefix=None):
     """Deterministically (via rng) build a small random DAG + equalities.
 
     Returns (cc, terms, equalities) where terms mirrors cc's table."""
@@ -87,7 +88,10 @@ def build_random_instance(rng, n_consts=3, n_terms=9, n_eqs=4):
         a = rng.randrange(len(terms))
         b = rng.randrange(len(terms))
         if a != b:
-            cc.assert_equal(a, b)
+            source = None
+            if source_prefix is not None:
+                source = f"{source_prefix}-{len(equalities)}"
+            cc.assert_equal(a, b, source=source)
             equalities.append((a, b))
     return cc, terms, equalities
 
@@ -271,6 +275,124 @@ class TestBatch(unittest.TestCase):
         with self.assertRaises(ValidationError) as ctx:
             cc.apply_batch([("=", a, 99)])
         self.assertIn("op 0", str(ctx.exception))
+
+    def test_batch_equality_source_can_be_revoked(self):
+        cc = CongruenceClosure()
+        a, b, c = (cc.add_term(n) for n in "abc")
+        cc.apply_batch([("=", a, b, "early"), ("=", b, c, "later")])
+        self.assertEqual(cc.input_sources, ("early", "later"))
+        cc.revoke_source("early")
+        self.assertFalse(cc.are_equal(a, b))
+        self.assertTrue(cc.are_equal(b, c))
+        self.assertFalse(cc.are_equal(a, c))
+
+    def test_batch_distinct_does_not_accept_source_field(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term("a"), cc.add_term("b")
+        with self.assertRaises(ValidationError):
+            cc.apply_batch([("!=", a, b, "ignored")])
+
+
+class TestRevokeSource(unittest.TestCase):
+    def test_revoke_early_keeps_later_equalities(self):
+        cc = CongruenceClosure()
+        a, b, c = (cc.add_term(n) for n in "abc")
+        cc.assert_equal(a, b, source="early")
+        cc.assert_equal(b, c, source="later")
+
+        removed = cc.revoke_source("early")
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(cc.input_equalities, ((b, c),))
+        self.assertEqual(cc.input_sources, ("later",))
+        self.assertFalse(cc.are_equal(a, b))
+        self.assertTrue(cc.are_equal(b, c))
+        self.assertFalse(cc.are_equal(a, c))
+        with self.assertRaises(NotEqualError):
+            cc.explain(a, c)
+
+    def test_revoke_one_basis_keeps_independent_basis(self):
+        cc = CongruenceClosure()
+        a, b, c = (cc.add_term(n) for n in "abc")
+        fa = cc.add_term("f", [a])
+        fb = cc.add_term("f", [b])
+        cc.assert_equal(a, b, source="removed-direct")
+        cc.assert_equal(a, c, source="later-one")
+        cc.assert_equal(c, b, source="later-two")
+
+        cc.revoke_source("removed-direct")
+
+        self.assertTrue(cc.are_equal(a, b))
+        self.assertTrue(cc.are_equal(fa, fb))
+        proof_ab = cc.explain(a, b)
+        proof_f = cc.explain(fa, fb)
+        self.assertTrue(verify_proof(proof_ab, a, b,
+                                     cc.input_equalities, cc.terms))
+        self.assertTrue(verify_proof(proof_f, fa, fb,
+                                     cc.input_equalities, cc.terms))
+        used = {(edge[1], edge[2]) for edge in proof_ab
+                if edge[0] == "input"}
+        self.assertEqual(used, {(a, c), (c, b)})
+        with self.assertRaises(ProofError):
+            verify_proof((("input", a, b),), a, b,
+                         cc.input_equalities, cc.terms)
+
+    def test_revoke_makes_later_equality_and_distinct_satisfiable(self):
+        cc = CongruenceClosure()
+        a, b, c = (cc.add_term(n) for n in "abc")
+        fa = cc.add_term("f", [a])
+        fb = cc.add_term("f", [b])
+        cc.assert_distinct(fa, fb)
+        cc.assert_equal(a, c, source="early-path")
+        with self.assertRaises(ContradictionError):
+            cc.assert_equal(c, b, source="later-path")
+        self.assertFalse(cc.are_equal(c, b))
+
+        cc.revoke_source("early-path")
+        cc.assert_equal(c, b, source="later-path")
+
+        self.assertTrue(cc.are_equal(c, b))
+        self.assertFalse(cc.are_equal(a, b))
+        self.assertFalse(cc.are_equal(fa, fb))
+        self.assertEqual(cc.distinct_assertions, ((fa, fb),))
+
+    def test_revoke_removes_all_equalities_with_same_source(self):
+        cc = CongruenceClosure()
+        ids = [cc.add_term(f"c{i}") for i in range(4)]
+        cc.assert_equal(ids[0], ids[1], source="same")
+        cc.assert_equal(ids[2], ids[3], source="same")
+        cc.assert_equal(ids[1], ids[2], source="other")
+
+        self.assertEqual(cc.revoke_source("same"), 2)
+
+        self.assertEqual(cc.input_sources, ("other",))
+        self.assertTrue(cc.are_equal(ids[1], ids[2]))
+        self.assertFalse(cc.are_equal(ids[0], ids[1]))
+        self.assertFalse(cc.are_equal(ids[2], ids[3]))
+
+    def test_revoke_unknown_source_is_noop(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term("a"), cc.add_term("b")
+        cc.assert_equal(a, b, source="known")
+        self.assertEqual(cc.revoke_source("unknown"), 0)
+        self.assertTrue(cc.are_equal(a, b))
+
+    def test_random_revocation_matches_reference(self):
+        for seed in range(45, 75):
+            rng = random.Random(seed)
+            cc, terms, equalities = build_random_instance(
+                rng, source_prefix="source")
+            index = rng.randrange(len(equalities))
+            remaining = (equalities[:index] + equalities[index + 1:])
+
+            self.assertEqual(cc.revoke_source(f"source-{index}"), 1)
+
+            expected = reference_closure(terms, remaining)
+            for i in range(len(terms)):
+                for j in range(len(terms)):
+                    self.assertEqual(
+                        cc.are_equal(i, j), expected(i) == expected(j),
+                        f"seed={seed} removed={index} pair=({i},{j})")
 
 
 class TestExplainStability(unittest.TestCase):
