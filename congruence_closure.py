@@ -12,6 +12,10 @@ equality with uninterpreted function symbols:
 * every derived equality keeps its origin (an input equality or a congruence
   step), so ``explain`` returns an independently verifiable proof and a
   conflicting assertion returns a verifiable contradiction proof;
+* individual input equalities (and distinct assertions) can be retracted by
+  source: the remaining assertions are replayed, so conclusions supported
+  only by the retracted source are dropped while everything still supported
+  is kept, and no proof references the removed source;
 * every mutating operation is atomic: on conflict the operation (or the whole
   batch, for :meth:`CongruenceClosure.apply_batch`) is rolled back.
 
@@ -31,6 +35,7 @@ __all__ = [
     "UnknownNodeError",
     "NodeLimitError",
     "NotEqualError",
+    "UnknownEqualityError",
     "ContradictionError",
     "ProofError",
     "verify_proof",
@@ -77,6 +82,11 @@ class NotEqualError(CongruenceError):
     definitive "no proof exists", not an exhausted search budget.  The only
     resource bound in this module is the node limit (:class:`NodeLimitError`).
     """
+
+
+class UnknownEqualityError(CongruenceError):
+    """A retract call named a source that is not currently recorded
+    (never asserted, redundant when asserted, or already retracted)."""
 
 
 class ProofError(CongruenceError):
@@ -473,6 +483,85 @@ class CongruenceClosure:
         except ContradictionError:
             self._restore(snap)
             raise
+
+    # -- retraction by source -----------------------------------------------
+
+    def _rebuild(self):
+        """Recompute the closure from scratch over the existing DAG.
+
+        Replays the currently recorded input equalities and distinct
+        assertions.  Only called after the source lists have been edited,
+        so the replay is a sub-sequence of a previously successful run and
+        cannot conflict.
+        """
+        inputs = self._inputs
+        distincts = self._distincts
+        count = len(self._terms)
+        self._uf = list(range(count))
+        self._size = [1] * count
+        self._pf = [None] * count
+        self._sig = {}
+        self._class_parents = {nid: [] for nid in range(count)}
+        self._forbidden = {}
+        self._inputs = []
+        self._distincts = []
+        for nid, (func, args) in enumerate(self._terms):
+            for x in dict.fromkeys(args):
+                self._class_parents[self._find(x)].append(nid)
+            sig = (func, tuple(self._find(x) for x in args))
+            other = self._sig.get(sig)
+            if other is None:
+                self._sig[sig] = nid
+            else:
+                self._merge(nid, other, (_CONG, nid, other))
+        for a, b in inputs:
+            self._assert_equal_inner(a, b)
+        for a, b in distincts:
+            self._assert_distinct_inner(a, b)
+
+    def _retract(self, sources, a, b, kind, where):
+        self._check_node(a, where + ': a')
+        self._check_node(b, where + ': b')
+        pair = _norm_pair(a, b)
+        for i, (x, y) in enumerate(sources):
+            if _norm_pair(x, y) == pair:
+                break
+        else:
+            raise UnknownEqualityError(
+                f'{where}: no recorded {kind} source for terms {a} and {b}')
+        snap = self._snapshot()
+        del sources[i]
+        try:
+            self._rebuild()
+        except ContradictionError:  # unreachable for a sub-replay
+            self._restore(snap)
+            raise
+
+    def retract_equal(self, a, b):
+        """Retract the input equality ``a = b`` previously asserted.
+
+        The remaining assertions are kept (including ones submitted after
+        the retracted equality) and the closure is recomputed from them:
+        equalities still supported by other sources remain, conclusions
+        that depended solely on the retracted source are dropped, distinct
+        constraints that become satisfiable again are unblocked, and no
+        later proof references the removed source.  Atomic: on any failure
+        the structure is left exactly as before the call.
+
+        Raises :class:`UnknownEqualityError` if no such input equality is
+        currently recorded (note: an assertion that was redundant at the
+        time it was made is not recorded as a source).
+        """
+        self._retract(self._inputs, a, b, 'equality', 'retract_equal')
+
+    def retract_distinct(self, a, b):
+        """Retract the distinct assertion ``a != b`` previously asserted.
+
+        Same replay semantics as :meth:`retract_equal`.  Raises
+        :class:`UnknownEqualityError` if no such distinct assertion is
+        currently recorded.
+        """
+        self._retract(self._distincts, a, b, 'distinct', 'retract_distinct')
 
     # -- explanation ------------------------------------------------------------
 

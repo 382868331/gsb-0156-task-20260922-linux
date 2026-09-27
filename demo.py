@@ -8,12 +8,37 @@ batch rollback, and invalid input).  No sleeps, no recorded output.
 from congruence_closure import (
     CongruenceClosure,
     ContradictionError,
+    UnknownEqualityError,
     ValidationError,
     proof_to_str,
     term_to_str,
     verify_contradiction,
     verify_proof,
 )
+
+
+def retraction_scenario():
+    print("\n=== 4. Retract an early source while keeping later ones ===")
+    cc = CongruenceClosure()
+    a, b, c = (cc.add_term(s) for s in ("a", "b", "c"))
+    fa, fb, fc = (cc.add_term("f", [t]) for t in (a, b, c))
+    cc.assert_equal(a, b)
+    cc.assert_equal(b, c)
+    print("after both assertions: a = c is", cc.are_equal(a, c),
+          "; f(a) = f(c) is", cc.are_equal(fa, fc))
+    cc.retract_equal(a, b)
+    print("after retracting a = b: a = c is", cc.are_equal(a, c),
+          "; b = c is", cc.are_equal(b, c),
+          "; f(a) = f(b) is", cc.are_equal(fa, fb))
+    proof = cc.explain(fb, fc)
+    print("proof of f(b) = f(c) after retraction:")
+    print(proof_to_str(proof, cc.terms))
+    print("independent verification:", verify_proof(
+        proof, fb, fc, cc.input_equalities, cc.terms))
+    try:
+        cc.retract_equal(a, b)
+    except UnknownEqualityError as err:
+        print(f"second retraction rejected: {err}")
 
 
 def normal_scenario():
@@ -79,6 +104,7 @@ def rejection_scenario():
 def main():
     normal_scenario()
     rejection_scenario()
+    retraction_scenario()
     print("\ndemo finished.")
 
 

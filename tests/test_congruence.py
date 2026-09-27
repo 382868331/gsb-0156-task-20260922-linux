@@ -18,6 +18,7 @@ from congruence_closure import (  # noqa: E402
     ContradictionError,
     NodeLimitError,
     NotEqualError,
+    UnknownEqualityError,
     ProofError,
     UnknownNodeError,
     ValidationError,
@@ -447,5 +448,123 @@ class TestDeepTerms(unittest.TestCase):
                                      cc.terms))
 
 
-if __name__ == "__main__":
+
+
+class TestRetraction(unittest.TestCase):
+    def test_retract_middle_equality_keeps_later_ones(self):
+        cc = CongruenceClosure()
+        a, b, c = (cc.add_term(s) for s in ('a', 'b', 'c'))
+        cc.assert_equal(a, b)
+        cc.assert_equal(b, c)
+        self.assertTrue(cc.are_equal(a, c))
+        cc.retract_equal(a, b)
+        self.assertFalse(cc.are_equal(a, b))
+        self.assertFalse(cc.are_equal(a, c))
+        self.assertTrue(cc.are_equal(b, c))
+        self.assertEqual(cc.input_equalities, ((b, c),))
+
+    def test_conclusion_kept_when_other_support_remains(self):
+        # f(a) = f(b) is asserted as an input first; later a = b gives an
+        # independent congruence justification, so retracting the input
+        # edge must leave the conclusion in place.
+        cc = CongruenceClosure()
+        a, b = cc.add_term('a'), cc.add_term('b')
+        fa, fb = cc.add_term('f', [a]), cc.add_term('f', [b])
+        cc.assert_equal(fa, fb)
+        cc.assert_equal(a, b)
+        cc.retract_equal(fa, fb)
+        self.assertTrue(cc.are_equal(a, b))
+        self.assertTrue(cc.are_equal(fa, fb))
+        self.assertEqual(cc.input_equalities, ((a, b),))
+        proof = cc.explain(fa, fb)
+        self.assertTrue(verify_proof(proof, fa, fb, cc.input_equalities,
+                                     cc.terms))
+
+    def test_only_congruence_from_retracted_source_is_dropped(self):
+        cc = CongruenceClosure()
+        a, b, c, d = (cc.add_term(s) for s in ('a', 'b', 'c', 'd'))
+        fa = cc.add_term('f', [a])
+        fb = cc.add_term('f', [b])
+        fc = cc.add_term('f', [c])
+        fd = cc.add_term('f', [d])
+        cc.assert_equal(a, b)
+        cc.assert_equal(c, d)
+        cc.assert_equal(fa, fc)
+        self.assertTrue(cc.are_equal(fb, fd))
+        cc.retract_equal(a, b)
+        self.assertFalse(cc.are_equal(fa, fb))
+        self.assertTrue(cc.are_equal(fc, fd))
+        self.assertTrue(cc.are_equal(fa, fc))
+        self.assertFalse(cc.are_equal(fb, fa))
+        self.assertFalse(cc.are_equal(fb, fd))
+
+    def test_retracted_source_disappears_from_proofs(self):
+        cc = CongruenceClosure()
+        a, b, c = (cc.add_term(s) for s in ('a', 'b', 'c'))
+        cc.assert_equal(a, b)
+        cc.assert_equal(b, c)
+        cc.retract_equal(a, b)
+        with self.assertRaises(NotEqualError):
+            cc.explain(a, c)
+        stale = (('input', a, b), ('input', b, c))
+        with self.assertRaises(ProofError):
+            verify_proof(stale, a, c, cc.input_equalities, cc.terms)
+        fresh = cc.explain(b, c)
+        self.assertTrue(verify_proof(fresh, b, c, cc.input_equalities,
+                                     cc.terms))
+
+    def test_distinct_constraint_becomes_satisfiable_again(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term('a'), cc.add_term('b')
+        fa, fb = cc.add_term('f', [a]), cc.add_term('f', [b])
+        cc.assert_equal(a, b)
+        with self.assertRaises(ContradictionError):
+            cc.assert_distinct(fa, fb)
+        cc.retract_equal(a, b)
+        cc.assert_distinct(fa, fb)
+        self.assertFalse(cc.are_equal(fa, fb))
+        with self.assertRaises(ContradictionError):
+            cc.assert_equal(a, b)
+        self.assertFalse(cc.are_equal(a, b))
+
+    def test_retract_distinct_unblocks_later_merge(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term('a'), cc.add_term('b')
+        cc.assert_distinct(a, b)
+        cc.retract_distinct(a, b)
+        cc.assert_equal(a, b)
+        self.assertTrue(cc.are_equal(a, b))
+
+    def test_retract_unknown_source_and_validation(self):
+        cc = CongruenceClosure()
+        a, b = cc.add_term('a'), cc.add_term('b')
+        with self.assertRaises(UnknownEqualityError):
+            cc.retract_equal(a, b)
+        cc.assert_equal(a, b)
+        cc.retract_equal(a, b)
+        with self.assertRaises(UnknownEqualityError):
+            cc.retract_equal(a, b)
+        with self.assertRaises(UnknownNodeError):
+            cc.retract_equal(a, 99)
+
+    def test_random_retractions_match_reference(self):
+        for seed in range(45, 70):
+            rng = random.Random(seed)
+            cc, terms, equalities = build_random_instance(
+                rng, n_consts=4, n_terms=10, n_eqs=6)
+            keep = []
+            for i, pair in enumerate(cc.input_equalities):
+                if i % 2 == 0:
+                    keep.append(pair)
+                else:
+                    cc.retract_equal(*pair)
+            self.assertEqual(cc.input_equalities, tuple(keep))
+            find = reference_closure(terms, keep)
+            for i in range(len(terms)):
+                for j in range(len(terms)):
+                    self.assertEqual(cc.are_equal(i, j), find(i) == find(j),
+                                     f'seed={seed} pair=({i},{j})')
+
+
+if __name__ == '__main__':
     unittest.main()
